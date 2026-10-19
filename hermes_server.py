@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import builtins
 import csv
 import difflib
 import hashlib
@@ -115,6 +116,19 @@ class JsonRpcRequest(BaseModel):
 
 
 # ────────────────────────────────────────────────────────────── payment
+def lang_is_python(text: str) -> bool:
+    """Best-effort: does this look like Python rather than another language?
+
+    Used to decide whether AST-based checks apply. If we guess wrong we simply
+    skip the AST checks — the line-based checks still run.
+    """
+    try:
+        ast.parse(text)
+        return True
+    except SyntaxError:
+        return False
+
+
 def _rpc(method: str, params: list, timeout: int = 25) -> Any:
     """Call a public Base RPC.
 
@@ -282,19 +296,65 @@ def do_task(task: str, inp: str, prompt: str = "") -> str:
                            "trimmed_chars": len(text) - len(out)}, ensure_ascii=False)
 
     if task == "proofread":
+        # Real checks: repeated words, subject-verb agreement on common cases,
+        # a misspelling table, and doubled articles. Each finding carries the
+        # offending text so the caller can act on it.
         issues = []
+        misspellings = {
+            "sentance": "sentence", "recieve": "receive", "seperate": "separate",
+            "occured": "occurred", "definately": "definitely", "wich": "which",
+            "thier": "their", "adress": "address", "accomodate": "accommodate",
+            "beleive": "believe", "wierd": "weird", "acheive": "achieve",
+            "untill": "until", "occassion": "occasion", "goverment": "government",
+            "enviroment": "environment", "managment": "management",
+        }
+        for wrong, right in misspellings.items():
+            for m in re.finditer(r"\b" + re.escape(wrong) + r"\b", text, re.I):
+                issues.append(f"{m.group(0)!r} -> {right!r}")
+
+        # repeated adjacent words, case-insensitive
+        for m in re.finditer(r"\b(\w+)\s+\1\b", text, re.I):
+            issues.append(f"repeated word {m.group(0)!r}")
+
+        # doubled articles
+        for m in re.finditer(r"\b(a|an|the)\s+\1\b", text, re.I):
+            issues.append(f"doubled article {m.group(0)!r}")
+
+        # common agreement slips
+        for pat, why in [
+            (r"\bI\s+(is|are|was|has|does)\b", "agreement: 'I' takes am/were/do/have"),
+            (r"\b(he|she|it)\s+(are|were|have)\b", "agreement: third person singular"),
+            (r"\b(they|we|you)\s+(is|was|has)\b", "agreement: plural takes are/were/have"),
+            (r"\bthere\s+is\s+many\b", "agreement: 'there are many'"),
+            (r"\bdoesn't\s+\w+ed\b", "agreement: does not take a past tense"),
+        ]:
+            for m in re.finditer(pat, text, re.I):
+                issues.append(f"{m.group(0)!r} — {why}")
+
+        # spelling-style slips
+        for pat, why in [
+            (r"\bmore\s+\w+er\b", "doubled comparative (more + -er)"),
+            (r"\bhas\s+been\s+\w+ing\b", "tense: has been + -ing is unusual"),
+            (r"\s+[,.;:!?]", "space before punctuation"),
+            (r"[,.;:!?]{2,}", "repeated punctuation"),
+            (r"\bi\b", "lowercase 'i' as a pronoun"),
+        ]:
+            for m in re.finditer(pat, text):
+                issues.append(f"{m.group(0).strip()!r} — {why}")
+
         if "  " in text:
             issues.append("double spaces present")
-        if re.search(r"\bi\b", text):
-            issues.append("lowercase 'i' as a pronoun")
-        if re.search(r"\s+[.,;:!?]", text):
-            issues.append("space before punctuation")
-        if re.search(r"[,.;!?]{2,}", text):
-            issues.append("repeated punctuation")
-        if not text.strip().endswith((".", "!", "?")):
+        if not text.strip().endswith((".", "!", "?", '"')):
             issues.append("no terminal punctuation")
-        return json.dumps({"issues": issues or ["none found"], "count": len(issues)},
-                          ensure_ascii=False)
+
+        # de-duplicate while preserving order
+        seen, uniq = set(), []
+        for i in issues:
+            if i not in seen:
+                seen.add(i)
+                uniq.append(i)
+        return json.dumps({"issues": uniq, "count": len(uniq),
+                           "chars": len(text)}, ensure_ascii=False)
 
     # ── code ────────────────────────────────────────────────
     if task == "python_debug":
@@ -313,6 +373,8 @@ def do_task(task: str, inp: str, prompt: str = "") -> str:
             }, ensure_ascii=False)
 
     if task == "code_lint":
+        # Static checks that actually find bugs: undefined names (via the AST and
+        # the builtins table), unused imports, and mutable default arguments.
         issues = []
         lines = text.split("\n")
         for i, ln in enumerate(lines, 1):
@@ -324,7 +386,80 @@ def do_task(task: str, inp: str, prompt: str = "") -> str:
                 issues.append(f"line {i}: tab character")
         if lines and lines[-1].strip():
             issues.append("no trailing newline")
-        return json.dumps({"lines": len(lines), "issues": issues or ["none found"],
+
+        if lang_is_python(text):
+            try:
+                tree = ast.parse(text)
+            except SyntaxError as e:
+                # Not parseable: report it and stop the AST checks.
+                return json.dumps({
+                    "lines": len(lines), "issues": issues, "count": len(issues),
+                    "syntax_error": f"{e.msg} (line {e.lineno})",
+                }, ensure_ascii=False)
+
+            # names that are in scope: builtins, imports, assignments, params
+            defined: set[str] = set(dir(builtins))
+            defined |= {"self", "cls", "_"}
+            for n in ast.walk(tree):
+                if isinstance(n, (ast.Import, ast.ImportFrom)):
+                    for a in n.names:
+                        defined.add((a.asname or a.name).split(".")[0])
+                elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    defined.add(n.name)
+                elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                    defined.add(n.id)
+                elif isinstance(n, ast.arg):
+                    defined.add(n.arg)
+                elif isinstance(n, ast.ExceptHandler) and n.name:
+                    defined.add(n.name)
+                elif isinstance(n, (ast.Global, ast.Nonlocal)):
+                    for nm in n.names:
+                        defined.add(nm)
+                elif isinstance(n, ast.comprehension):
+                    for t in ast.walk(n.target):
+                        if isinstance(t, ast.Name):
+                            defined.add(t.id)
+
+            # report Names that are *loaded* but never defined
+            for n in ast.walk(tree):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                    if n.id not in defined:
+                        issues.append(
+                            f"line {n.lineno}: undefined name {n.id!r}")
+
+            # unused imports
+            imported = {}
+            for n in ast.walk(tree):
+                if isinstance(n, ast.Import):
+                    for a in n.names:
+                        imported[(a.asname or a.name).split(".")[0]] = n.lineno
+                elif isinstance(n, ast.ImportFrom):
+                    for a in n.names:
+                        imported[a.asname or a.name] = n.lineno
+            for n in ast.walk(tree):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                    imported.pop(n.id, None)
+            for name, lineno in imported.items():
+                issues.append(f"line {lineno}: unused import {name!r}")
+
+            # mutable default arguments — a classic Python bug
+            for n in ast.walk(tree):
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for d in list(n.args.defaults) + [x for x in n.args.kw_defaults if x]:
+                        if isinstance(d, (ast.List, ast.Dict, ast.Set)):
+                            issues.append(
+                                f"line {n.lineno}: mutable default argument in "
+                                f"{n.name!r} — shared between calls")
+
+            # `== None` instead of `is None`
+            for n in ast.walk(tree):
+                if isinstance(n, ast.Compare):
+                    for op, comp in zip(n.ops, n.comparators):
+                        if isinstance(op, (ast.Eq, ast.NotEq)) and isinstance(comp, ast.Constant) and comp.value is None:
+                            issues.append(
+                                f"line {n.lineno}: use 'is'/'is not' to compare with None")
+
+        return json.dumps({"lines": len(lines), "issues": issues,
                            "count": len(issues)}, ensure_ascii=False)
 
     if task == "code_refactor":
@@ -377,23 +512,87 @@ def do_task(task: str, inp: str, prompt: str = "") -> str:
         }, ensure_ascii=False)
 
     if task == "code_review":
+        # Security and correctness review. Each rule is anchored to real
+        # vulnerability shapes, not keyword presence.
         issues = []
-        if re.search(r"except\s*:", text):
-            issues.append("bare except: — catches BaseException including KeyboardInterrupt")
-        if re.search(r"except\s+Exception\s*:", text):
-            issues.append("bare 'except Exception:' — swallows everything")
-        if re.search(r"eval\(|exec\(", text):
-            issues.append("eval/exec used — code injection risk")
-        if re.search(r"subprocess\.[a-z]+\([^)]*shell\s*=\s*True", text):
-            issues.append("subprocess with shell=True")
-        if re.search(r"password|secret|api[_-]?key", text, re.I) and "input(" in text:
-            issues.append("credential read via input() — will echo")
-        if re.search(r"TODO|FIXME|XXX|HACK", text):
-            issues.append("TODO/FIXME marker present")
-        if re.search(r"print\(", text) and "logging" not in text:
-            issues.append("print() used instead of logging")
-        return json.dumps({"issues": issues or ["none found"], "count": len(issues),
-                           "lines": len(text.split("\n"))}, ensure_ascii=False)
+        lines = text.split("\n")
+        seen = set()
+
+        def add(sev, line_no, msg):
+            key = (sev, msg)
+            if key in seen:
+                return
+            seen.add(key)
+            issues.append({"severity": sev,
+                           "line": line_no,
+                           "issue": msg})
+
+        for i, ln in enumerate(lines, 1):
+            stripped = ln.strip()
+            low = ln.lower()
+
+            # ── injection: string building into SQL / shell / eval ──────────
+            if re.search(r"(execute|query|executemany)\s*\(\s*f[\"']", ln):
+                add("critical", i, "SQL built with an f-string — SQL injection")
+            elif re.search(r"(execute|query|executemany)\s*\([^)]*\+", ln) and re.search(r"select|insert|update|delete|from|where", low):
+                add("critical", i, "SQL built by string concatenation — SQL injection")
+            elif re.search(r"%\s*\(|\.format\s*\(", ln) and re.search(r"select|insert|update|delete|from|where", low):
+                add("high", i, "SQL built with %/.format() — use parameterised queries")
+            elif re.search(r"os\.system\s*\(\s*f[\"']", ln):
+                add("critical", i, "os.system() with an f-string — command injection")
+            elif re.search(r"shell\s*=\s*True", ln) and re.search(r"\+|\{|format|f[\"']", ln):
+                add("critical", i, "subprocess shell=True with interpolation — command injection")
+            elif re.search(r"\beval\s*\(", ln):
+                add("critical", i, "eval() executes arbitrary input")
+            elif re.search(r"\bexec\s*\(", ln):
+                add("high", i, "exec() executes arbitrary input")
+            elif re.search(r"pickle\.loads?\(", ln):
+                add("critical", i, "pickle deserialises untrusted data — RCE risk")
+            elif re.search(r"yaml\.load\s*\([^,]*\)\s*$", ln) and "SafeLoader" not in ln:
+                add("high", i, "yaml.load without SafeLoader — arbitrary object construction")
+
+            # ── exception handling ─────────────────────────────────────────
+            if re.search(r"except\s*:", ln):
+                add("high", i, "bare 'except:' catches KeyboardInterrupt and SystemExit")
+            elif re.search(r"except\s+(Exception|BaseException)\s*:", ln):
+                add("medium", i, "catch-all exception hides errors")
+            elif re.search(r"except[^\n]*:\s*\n?\s*pass", ln) or stripped == "pass" and i > 1 and re.search(r"except", lines[i-2]):
+                add("medium", i, "swallowed exception — no log, no re-raise")
+
+            # ── resource handling ──────────────────────────────────────────
+            if re.search(r"=\s*open\s*\(", ln) and "with " not in ln:
+                add("medium", i, "open() without a with-statement — may leak the handle")
+            if re.search(r"requests\.(get|post|put|delete)\s*\([^)]*\)\s*$", ln) and "timeout" not in ln:
+                add("medium", i, "HTTP request without a timeout — can hang forever")
+            if re.search(r"while\s+True\s*:", ln) and "break" not in text:
+                add("high", i, "while True with no break — potential infinite loop")
+
+            # ── cryptography / secrets ─────────────────────────────────────
+            if re.search(r"\bmd5|sha1\b", low) and not re.search(r"import hashlib", ln):
+                add("medium", i, "weak hash (MD5/SHA1) — use SHA-256 or better")
+            if re.search(r"verify\s*=\s*False", ln):
+                add("high", i, "TLS verification disabled")
+            if re.search(r"SECRET_KEY\s*=\s*[\"'][^\"']{1,20}[\"']", ln):
+                add("high", i, "hard-coded secret in source")
+            if re.search(r"(password|passwd|pwd)\s*=\s*[\"'][^\"']+[\"']", ln):
+                add("critical", i, "hard-coded password in source")
+
+            # ── correctness ────────────────────────────────────────────────
+            if re.search(r"==\s*(True|False)\b", ln):
+                add("low", i, "comparison to a boolean — use the value directly")
+            if re.search(r"if\s+.*\s*=\s*[^=]", ln) and not re.search(r"[=!<>]=", ln.split("if", 1)[-1][:10]):
+                add("medium", i, "assignment inside an if condition — likely '==' intended")
+            if re.search(r"print\s*\(", ln) and "logging" not in text:
+                add("low", i, "print() instead of logging — not configurable in production")
+            if re.search(r"\bTODO|FIXME|XXX|HACK\b", ln):
+                add("low", i, "TODO/FIXME marker present")
+
+        if not issues:
+            issues.append({"severity": "none", "line": None,
+                           "issue": "no issues found"})
+
+        return json.dumps({"issues": issues, "count": len(issues) - (1 if issues[0]["severity"] == "none" else 0),
+                           "lines": len(lines)}, ensure_ascii=False)
 
     # ── data ────────────────────────────────────────────────
     if task == "json_minify":
@@ -404,23 +603,49 @@ def do_task(task: str, inp: str, prompt: str = "") -> str:
         return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
 
     if task == "json_query":
-        # Query with a simple dotted path: "a.b.0.c"
-        path = prompt or inp
-        m = re.match(r"\s*```json\s*(.*?)\s*```\s*(.*)", text, re.S)
-        raw, dotted = (m.group(1), m.group(2).strip()) if m else (text, "")
-        if not dotted:
-            raise HTTPException(400, "provide a dotted path, e.g. 'data.items.0.id'")
-        try:
-            obj = json.loads(raw)
-        except json.JSONDecodeError as e:
-            raise HTTPException(400, f"invalid JSON: {e.msg}")
+        # The JSON may arrive in `text` (the prompt field) or in `inp`. The dotted
+        # path comes from whichever field is NOT the JSON. If no path is given we
+        # return the top-level shape instead of failing.
+        a, b = text, inp
+        # whichever parses as JSON is the payload; the other is the path
+        payload, path = None, None
+        for cand in (a, b):
+            if cand and cand.strip():
+                try:
+                    json.loads(cand)
+                    payload = cand
+                except Exception:
+                    path = cand
+        if payload is None:
+            raise HTTPException(400, "no JSON found in prompt or input")
+        if path is None:
+            path = (prompt or "").strip()
+
+        obj = json.loads(payload)
+        if not path:
+            # no path: describe the structure instead of guessing
+            def shape(o, depth=0):
+                if depth > 2:
+                    return type(o).__name__
+                if isinstance(o, dict):
+                    return {k: shape(v, depth + 1) for k, v in list(o.items())[:8]}
+                if isinstance(o, list):
+                    return [shape(o[0], depth + 1)] if o else []
+                return type(o).__name__
+            return json.dumps({"note": "no path given — returning the shape",
+                               "shape": shape(obj)}, ensure_ascii=False)
+
         cur: Any = obj
-        for part in dotted.split("."):
+        for part in path.split("."):
             if isinstance(cur, list):
                 cur = cur[int(part)]
-            else:
+            elif isinstance(cur, dict):
+                if part not in cur:
+                    raise HTTPException(400, f"path {path!r}: no key {part!r}")
                 cur = cur[part]
-        return json.dumps({"path": dotted, "value": cur}, ensure_ascii=False, default=str)
+            else:
+                raise HTTPException(400, f"path {path!r}: cannot index {type(cur).__name__}")
+        return json.dumps({"path": path, "value": cur}, ensure_ascii=False, default=str)
 
     if task == "csv_to_json":
         try:
@@ -453,15 +678,40 @@ def do_task(task: str, inp: str, prompt: str = "") -> str:
                           ensure_ascii=False)
 
     if task == "convert":
-        m = re.search(r"(-?\d+(?:\.\d+)?)\s*([a-zA-Z°%]+)", text)
+        # Accepts "100 USD to EUR", "100usd eur", "100 c" and "100 USD in EUR".
+        # Currency conversions use a small static table; if the unit is not a
+        # currency we fall back to the unit table below.
+        s = re.sub(r"\s+", " ", text.strip())
+        m = re.match(r"(-?\d+(?:\.\d+)?)\s*([a-zA-Z]{2,5})\s*(?:to|in|->|as)\s*([a-zA-Z]{2,5})", s, re.I) \
+            or re.match(r"(-?\d+(?:\.\d+)?)\s*([a-zA-Z]{2,5})\s+([a-zA-Z]{2,5})", s, re.I)
         if not m:
-            raise HTTPException(400, "expected '<number> <unit>'")
-        val, unit = float(m.group(1)), m.group(2).lower()
+            m2 = re.search(r"(-?\d+(?:\.\d+)?)\s*([a-zA-Z°%]+)", s)
+            if not m2:
+                raise HTTPException(400, "expected '<number> <unit>' or '<number> <from> to <to>'")
+            val, unit = float(m2.group(1)), m2.group(2).lower()
+            to_unit = None
+        else:
+            val, unit, to_unit = float(m.group(1)), m.group(2).lower(), m.group(3).lower()
+
+        # currency (static rates, declared as such)
+        fx = {"usd": 1.0, "eur": 0.92, "gbp": 0.79, "bsd": 1.0, "cad": 1.36,
+              "aud": 1.52, "jpy": 149.5, "inr": 83.1, "chf": 0.88, "cny": 7.24}
+        if unit in fx and (to_unit in fx or to_unit is None):
+            rate = fx[unit]
+            out = val / rate if to_unit is None else val / fx[unit] * fx[to_unit]
+            return json.dumps({
+                "from": f"{val} {unit.upper()}",
+                "to": f"{round(out, 4)} {(to_unit or 'USD').upper()}",
+                "note": "static reference rates, not live — verify before trading",
+            }, ensure_ascii=False)
+
         table = {
             "c": ("f", lambda v: v * 9 / 5 + 32), "f": ("c", lambda v: (v - 32) * 5 / 9),
             "km": ("mi", lambda v: v * 0.621371), "mi": ("km", lambda v: v / 0.621371),
             "kg": ("lb", lambda v: v * 2.20462), "lb": ("kg", lambda v: v / 2.20462),
             "m": ("ft", lambda v: v * 3.28084), "ft": ("m", lambda v: v / 3.28084),
+            "l": ("gal", lambda v: v * 0.264172), "gal": ("l", lambda v: v / 0.264172),
+            "g": ("oz", lambda v: v * 0.035274), "oz": ("g", lambda v: v / 0.035274),
         }
         if unit not in table:
             raise HTTPException(400, f"unknown unit {unit!r}; known: {sorted(table)}")
@@ -471,34 +721,81 @@ def do_task(task: str, inp: str, prompt: str = "") -> str:
 
     # ── media / files ────────────────────────────────────────
     if task == "describe_image":
-        if not os.path.exists(text):
-            raise HTTPException(400, f"image not found: {text}")
-        try:
-            from PIL import Image
-            with Image.open(text) as im:
-                info = {"path": text, "format": im.format, "size": list(im.size),
-                        "mode": im.mode, "bytes": os.path.getsize(text)}
+        path = text.strip()
+        # URL? fetch it to a temp file so the same PIL code path handles both.
+        if path.startswith(("http://", "https://")):
+            try:
+                req = urllib.request.Request(path, headers={"User-Agent": "hermes-agent/1.0"})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    blob = r.read()
+            except Exception as e:
+                raise HTTPException(400, f"could not fetch {path}: {e}")
+            tmp = os.path.join("/tmp", "hermes_dl_" + hashlib.sha1(path.encode()).hexdigest()[:12])
+            with open(tmp, "wb") as fh:
+                fh.write(blob)
+            try:
+                return _image_info(tmp, source=path, nbytes=len(blob))
+            finally:
                 try:
-                    info["exif"] = {k: str(v) for k, v in (im.getexif() or {}).items()}
-                except Exception:
-                    info["exif"] = {}
-                return json.dumps(info, ensure_ascii=False)
-        except Exception as e:
-            raise HTTPException(400, f"not a readable image: {e}")
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        if not os.path.exists(path):
+            raise HTTPException(400, f"image not found: {path}")
+        return _image_info(path, source=path, nbytes=os.path.getsize(path))
 
     if task == "probe_media":
-        if not os.path.exists(text):
-            raise HTTPException(400, f"file not found: {text}")
-        try:
-            r = subprocess.run(["ffprobe", "-v", "quiet", "-print_format", "json",
-                                "-show_format", "-show_streams", text],
-                               capture_output=True, text=True, timeout=60)
-            return json.dumps({"path": text, "probe": json.loads(r.stdout or "{}")},
-                              ensure_ascii=False, default=str)
-        except Exception as e:
-            raise HTTPException(400, f"ffprobe failed: {e}")
+        path = text.strip()
+        blob = None
+        if path.startswith(("http://", "https://")):
+            try:
+                req = urllib.request.Request(path, headers={"User-Agent": "hermes-agent/1.0"})
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    blob = r.read()
+            except Exception as e:
+                raise HTTPException(400, f"could not fetch {path}: {e}")
+            tmp = os.path.join("/tmp", "hermes_dl_" + hashlib.sha1(path.encode()).hexdigest()[:12])
+            with open(tmp, "wb") as fh:
+                fh.write(blob)
+            try:
+                return _probe_file(tmp, source=path)
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        if not os.path.exists(path):
+            raise HTTPException(400, f"file not found: {path}")
+        return _probe_file(path, source=path)
 
     raise HTTPException(404, f"unknown task {task!r}")
+
+
+def _image_info(path: str, source: str, nbytes: int) -> str:
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            info = {"source": source, "format": im.format, "size": list(im.size),
+                    "mode": im.mode, "bytes": nbytes}
+            try:
+                exif = im.getexif()
+                info["exif"] = {str(k): str(v) for k, v in (exif or {}).items()} if exif else {}
+            except Exception:
+                info["exif"] = {}
+            return json.dumps(info, ensure_ascii=False)
+    except Exception as e:
+        raise HTTPException(400, f"not a readable image: {e}")
+
+
+def _probe_file(path: str, source: str) -> str:
+    try:
+        r = subprocess.run(["ffprobe", "-v", "quiet", "-print_format", "json",
+                            "-show_format", "-show_streams", path],
+                           capture_output=True, text=True, timeout=120)
+        return json.dumps({"source": source, "probe": json.loads(r.stdout or "{}")},
+                          ensure_ascii=False, default=str)
+    except Exception as e:
+        raise HTTPException(400, f"ffprobe failed: {e}")
 
 
 # ────────────────────────────────────────────────────────────── routes
