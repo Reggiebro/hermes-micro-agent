@@ -69,8 +69,40 @@ third-party API. It calls a public Base RPC and reads the chain.
 
 ## Honest limits
 
-- The public URL is a Cloudflare quick tunnel and changes on restart. There is no
-  SLA on it.
-- trycloudflare hosts are not indexed by x402 directories, so this is reached by
-  its API rather than by browsing a directory.
+- The public URL is a localtunnel host with a fixed-subdomain retry loop. It is
+  *usually* stable but not guaranteed — on a restart localtunnel can hand out a
+  random name instead, and the watchdog retries to win the fixed one back.
+- localtunnel hosts are not indexed by x402 directories, so this is reached by its
+  API rather than by browsing a directory.
 - These are deterministic transformations, not a language model.
+
+## Public URL — what was actually tested (2026-10-19)
+
+The requirement was: free, stable, no account. Tested for real:
+
+| Method | Free | Stable URL | No account | x402 directories accept it |
+|---|---|---|---|---|
+| `localtunnel --subdomain X` | yes | **not guaranteed** | yes | **no** |
+| serveo (anonymous) | yes | **no** — random every time | yes | no |
+| is-a.dev | yes | yes | yes | yes, but see note |
+| own domain + Cloudflare | ~$10/yr | yes | — | yes |
+
+Observed behaviour:
+
+- **localtunnel** requested `hermes-micro-agent.loca.lt` and got it. On a later
+  start it fell back to random names (`plastic-pig-82`, `rare-mule-99`). A retry
+  loop usually wins the fixed name back — that is what `tunnel_watch.sh` does.
+- **serveo** anonymous gave a different hostname on every single connection
+  (`c1bcabf9...`, `adb55090ea...`, `e5ec1963...`). Reserved hostnames require
+  registering an SSH key with a Google/GitHub login.
+- **is-a.dev** is a free `.dev` domain via GitHub PR, but the repo's `AGENTS.md`
+  states maintainers *do not accept AI-generated pull requests*. Opening one gets
+  it closed.
+- **x402-list.com** rejects tunnel hosts outright:
+  `"Service URL on a free hosting or dev-tunnel domain (loca.lt) is not allowed.
+  Please submit from your own domain."`
+
+**Conclusion: no free + stable + account-free URL exists that x402 directories will
+index.** The current setup uses localtunnel with a fixed-subdomain retry loop. To
+get a genuinely stable, indexable URL the options are a real domain (~$10/yr) or an
+is-a.dev subdomain submitted by a human.
