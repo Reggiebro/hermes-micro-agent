@@ -3,106 +3,103 @@
 A paid HTTP micro-service for AI agents. One endpoint, 20 tasks, USDC on Base.
 Payment is verified on-chain before any work runs.
 
-## Quick start
+## Free services — no payment, no key
+
+These four are free forever. Call them directly:
+
+```bash
+# SHA-256 hash of any text
+curl -X POST https://92.5.95.177.sslip.io/free/hash \
+  -H "Content-Type: application/json" -d '{"prompt":"hello world"}'
+
+# Base64 encode/decode
+curl -X POST https://92.5.95.177.sslip.io/free/base64 \
+  -H "Content-Type: application/json" -d '{"prompt":"hello"}'
+
+# Unit conversion (length, weight, temperature, data size)
+curl -X POST https://92.5.95.177.sslip.io/free/convert \
+  -H "Content-Type: application/json" -d '{"prompt":"10 km to miles"}'
+
+# Minify a JSON document
+curl -X POST https://92.5.95.177.sslip.io/free/json_minify \
+  -H "Content-Type: application/json" -d '{"prompt":"{  \"a\":  1 }"}'
+```
+
+Each returns `{"status":"success","task":"...","result":"...","free":true}`.
+
+## Paid services — $0.10-$0.25 per call
 
 ```bash
 # 1. See the price list
-curl https://news-home-exercises-designs.trycloudflare.com/tasks
+curl https://92.5.95.177.sslip.io/tasks
 
 # 2. Try a task — you get 402 with the address and the price
-curl -X POST https://news-home-exercises-designs.trycloudflare.com/task \
+curl -X POST https://92.5.95.177.sslip.io/task \
   -H "Content-Type: application/json" \
   -d '{"task":"summarize","prompt":"your text here"}'
 
 # 3. Pay USDC on Base to the address in the 402, then retry with the tx hash
-curl -X POST https://news-home-exercises-designs.trycloudflare.com/task \
+curl -X POST https://92.5.95.177.sslip.io/task \
   -H "Content-Type: application/json" \
   -H "X-Payment: 0x<tx_hash>" \
   -d '{"task":"summarize","prompt":"your text here"}'
 ```
 
-## Services
+**Or call a service by name** — one route per task, so a search for the service finds the route:
 
-| Category | Tasks | Price |
+| Route | Service | Price |
 |---|---|---|
-| Text | summarize, extract, keywords, sentiment | $0.10 |
-| Text | translate, rewrite, proofread | $0.15 |
-| Code | code_lint, code_explain | $0.15 |
-| Code | code_refactor, code_review, python_debug | $0.25 |
-| Data | json_minify, hash, base64, convert | $0.10 |
-| Data | json_query, csv_to_json | $0.15 |
-| Media | describe_image, probe_media | $0.15 |
+| `/summarize` | Summarise text | $0.10 |
+| `/extract` | Extract key points | $0.10 |
+| `/keywords` | Find keywords | $0.10 |
+| `/sentiment` | Detect sentiment | $0.10 |
+| `/translate` | Translate | $0.15 |
+| `/rewrite` | Rewrite text | $0.15 |
+| `/proofread` | Proofread | $0.15 |
+| `/code_lint` | Lint Python | $0.15 |
+| `/code_explain` | Explain code | $0.15 |
+| `/code_refactor` | Refactor code | $0.25 |
+| `/code_review` | Review code | $0.25 |
+| `/python_debug` | Debug Python | $0.25 |
+| `/json_query` | Query JSON | $0.15 |
+| `/csv_to_json` | CSV to JSON | $0.15 |
+| `/describe_image` | Describe an image | $0.15 |
+| `/probe_media` | Probe a media URL | $0.15 |
 
 ## Payment
 
     Receiver : 0x078fE079A9440631Bc6AD722D7143dC382b4ea4f
     Network  : base (eip155:8453)
     Asset    : USDC  0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
-    Scheme   : x402 exact
 
-The server reads the USDC `Transfer` event from the transaction receipt and checks
-recipient and amount. A fabricated hash, a payment to the wrong address, or a
-wrong amount all get `402` — and nothing runs.
+The USDC Transfer is verified on-chain before any work runs. Unpaid or
+unverifiable requests get 402 and nothing executes.
 
 ## Discovery
 
-    GET  /          service name, receiver, all tasks + prices
-    GET  /tasks     price list
-    GET  /task?task=summarize   402 + x402 payload
-    GET  /health    {"ok":true,"implemented":20}
+- OpenAPI: `https://92.5.95.177.sslip.io/openapi.json`
+- x402 manifest: `https://92.5.95.177.sslip.io/.well-known/x402`
+- Listed on [x402scan](https://www.x402scan.com/server/4d9a40cb-c0d9-4524-ad62-ac312b7ec7bb)
 
-## Agent-to-agent (JSON-RPC)
+## JSON-RPC utility gateway (free)
 
-    POST /rpc
-    {"jsonrpc":"2.0","id":1,"method":"price","params":{"task":"summarize"}}
-    {"jsonrpc":"2.0","id":1,"method":"discover","params":{}}
-    {"jsonrpc":"2.0","id":1,"method":"verify","params":{"tx_hash":"0x..."}}
-    {"jsonrpc":"2.0","id":1,"method":"echo","params":{}}
+```bash
+# Price one task
+curl -X POST https://92.5.95.177.sslip.io/rpc \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"price","params":{"task":"summarize"}}'
 
-## Running it yourself
-
-    cd ~/microsvc
-    .venv/bin/python hermes_server.py        # PORT=8000 default
-
-The payment verifier is stdlib-only (`base_verify.py`): no web3, no account, no
-third-party API. It calls a public Base RPC and reads the chain.
+# Verify a payment
+curl -X POST https://92.5.95.177.sslip.io/rpc \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"verify","params":{"tx_hash":"0x...","min_cents":1000}}'
+```
 
 ## Honest limits
 
-- The public URL is a localtunnel host with a fixed-subdomain retry loop. It is
-  *usually* stable but not guaranteed — on a restart localtunnel can hand out a
-  random name instead, and the watchdog retries to win the fixed one back.
-- localtunnel hosts are not indexed by x402 directories, so this is reached by its
-  API rather than by browsing a directory.
-- These are deterministic transformations, not a language model.
-
-## Public URL — what was actually tested (2026-10-19)
-
-The requirement was: free, stable, no account. Tested for real:
-
-| Method | Free | Stable URL | No account | x402 directories accept it |
-|---|---|---|---|---|
-| `localtunnel --subdomain X` | yes | **not guaranteed** | yes | **no** |
-| serveo (anonymous) | yes | **no** — random every time | yes | no |
-| is-a.dev | yes | yes | yes | yes, but see note |
-| own domain + Cloudflare | ~$10/yr | yes | — | yes |
-
-Observed behaviour:
-
-- **localtunnel** requested `hermes-micro-agent.loca.lt` and got it. On a later
-  start it fell back to random names (`plastic-pig-82`, `rare-mule-99`). A retry
-  loop usually wins the fixed name back — that is what `tunnel_watch.sh` does.
-- **serveo** anonymous gave a different hostname on every single connection
-  (`c1bcabf9...`, `adb55090ea...`, `e5ec1963...`). Reserved hostnames require
-  registering an SSH key with a Google/GitHub login.
-- **is-a.dev** is a free `.dev` domain via GitHub PR, but the repo's `AGENTS.md`
-  states maintainers *do not accept AI-generated pull requests*. Opening one gets
-  it closed.
-- **x402-list.com** rejects tunnel hosts outright:
-  `"Service URL on a free hosting or dev-tunnel domain (loca.lt) is not allowed.
-  Please submit from your own domain."`
-
-**Conclusion: no free + stable + account-free URL exists that x402 directories will
-index.** The current setup uses localtunnel with a fixed-subdomain retry loop. To
-get a genuinely stable, indexable URL the options are a real domain (~$10/yr) or an
-is-a.dev subdomain submitted by a human.
+- The paid tasks are deterministic transformations, not model calls. Same input,
+  same output.
+- `describe_image` and `probe_media` fetch URLs — a failed fetch is reported as
+  `[fetch failed: HTTP xxx]`, never invented.
+- Unlisted tasks are refused with 400, never faked.
+- There is no SLA. The endpoint is a single VPS on a free cloud tier.
