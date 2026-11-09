@@ -3,6 +3,8 @@
 A paid HTTP micro-service for AI agents. One endpoint, 20 tasks, USDC on Base.
 Payment is verified on-chain before any work runs.
 
+[![Hermes Micro-Agent MCP connector – tool definition quality and endpoint health on Glama](https://glama.ai/mcp/connectors/com.theworkpc.hermesmicroservice/hermes-micro-agent/badges/score.svg)](https://glama.ai/mcp/connectors/com.theworkpc.hermesmicroservice/hermes-micro-agent)
+
 ## Free services — no payment, no key
 
 These four are free forever. Call them directly:
